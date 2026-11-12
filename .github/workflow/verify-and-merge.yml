@@ -1,0 +1,109 @@
+# .github/workflows/verify-and-merge.yml
+# Runs on every PR opened by Cell 17 (branches fuzz-fix/*). Two jobs, in order:
+#   1. verify : the PR may only change one source file plus its .sig, and the .sig must verify
+#               against the pipeline's cosign public key (cosign verify-blob).
+#   2. merge  : runs only if verify passed, and merges the exact commit that was verified.
+# The failure-report PR (fuzz-failures-report/*) never matches, so it is never auto-merged.
+#
+# Design decisions:
+# W1. pull_request_target, not pull_request: the workflow definition comes from the base branch,
+#     so a PR cannot edit this file to skip its own verification. No code from the PR is ever
+#     executed here; the PR files are only read and hashed by cosign.
+# W2. Same-repo PRs only (no forks), and only head branches named fuzz-fix/*.
+# W3. Scope check: exactly 2 changed files, one existing .c/.cpp file (status "modified") and one
+#     signatures/*.sig. Anything else fails, so unsigned content can never ride along in a signed PR.
+# W4. The public key comes from the COSIGN_PUBLIC_KEY repository secret, not from a file in the PR,
+#     so a PR cannot swap the key it is verified against.
+# W5. cosign is pinned to v2.4.1, the same version the notebook signs with (Cell 16a).
+# W6. merge uses --match-head-commit: if anything is pushed to the branch after verification,
+#     the merge is refused.
+
+name: Verify signed patch and auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-and-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    if: >-
+      startsWith(github.event.pull_request.head.ref, 'fuzz-fix/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head_sha: ${{ steps.scope.outputs.head_sha }}
+    steps:
+      - name: Check which files the PR changes (W3)
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | [.status, .filename] | @tsv' > changed.tsv
+          echo "Files changed by this PR:"; cat changed.tsv
+
+          total=$(wc -l < changed.tsv)
+          src=$(awk -F'\t' '$1=="modified" && $2 ~ /\.(c|cpp)$/ && $2 !~ /^(signatures|\.github)\// {print $2}' changed.tsv)
+          sig=$(awk -F'\t' '($1=="added" || $1=="modified") && $2 ~ /^signatures\/[^\/]+\.sig$/ {print $2}' changed.tsv)
+
+          if [ "$total" -ne 2 ] || [ "$(printf '%s' "$src" | grep -c .)" -ne 1 ] || [ "$(printf '%s' "$sig" | grep -c .)" -ne 1 ]; then
+            echo "::error::PR must change exactly one existing .c/.cpp file and one signatures/*.sig file"
+            exit 1
+          fi
+
+          echo "source=$src" >> "$GITHUB_OUTPUT"
+          echo "signature=$sig" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the PR head (files are read, never executed)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Install cosign (W5)
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.4.1"
+
+      - name: Verify the signature (W4)
+        env:
+          COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+          SRC: ${{ steps.scope.outputs.source }}
+          SIG: ${{ steps.scope.outputs.signature }}
+        run: |
+          set -euo pipefail
+          if [ -z "$COSIGN_PUBLIC_KEY" ]; then
+            echo "::error::COSIGN_PUBLIC_KEY secret is not set"; exit 1
+          fi
+          printf '%s\n' "$COSIGN_PUBLIC_KEY" > "$RUNNER_TEMP/cosign.pub"
+          cosign verify-blob --key "$RUNNER_TEMP/cosign.pub" --signature "$SIG" "$SRC"
+          echo "Verified: $SRC matches $SIG"
+
+  merge:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Merge the verified commit (W6)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ needs.verify.outputs.head_sha }}
+        run: gh pr merge "$PR" --repo "$REPO" --merge --match-head-commit "$HEAD_SHA" --delete-branch
